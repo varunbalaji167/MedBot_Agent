@@ -11,7 +11,7 @@ from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
 # 1. PAGE CONFIG & SESSION STATE
 
-st.set_page_config(page_title="MediBot V3", page_icon="🩺", layout="centered")
+st.set_page_config(page_title="MediBot", page_icon="🩺", layout="centered")
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
