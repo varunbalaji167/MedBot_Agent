@@ -1,3 +1,4 @@
+import os
 import streamlit as st
 import torch
 import faiss
@@ -359,16 +360,37 @@ def process_message(user_message: str):
 
 with st.sidebar:
     st.header("Configuration")
-    st.write("Upload your medical guidelines PDF here to build the knowledge base.")
-    uploaded_file = st.file_uploader("Upload Medical PDF", type="pdf")
+    st.write(
+        "MediBot will automatically load 'Rag_pdf.pdf' from the project root if available."
+    )
 
-    if uploaded_file is not None:
-        if st.session_state.faiss_index is None:
-            with st.spinner("Processing PDF and creating embeddings..."):
+    # 1. Check for the local file in the project root
+    local_pdf_path = "Rag_pdf.pdf"
+    default_file_exists = os.path.exists(local_pdf_path)
+
+    # 2. Keep the uploader as an "Override" option
+    uploaded_file = st.file_uploader("Override with a different PDF", type="pdf")
+
+    # 3. Logic to process the PDF automatically
+    if st.session_state.faiss_index is None:
+        # Priority 1: Use the manually uploaded file
+        if uploaded_file is not None:
+            with st.spinner("Processing uploaded PDF..."):
                 process_pdf(uploaded_file.read())
-            st.success("Knowledge base ready!")
-    else:
-        st.warning("Please upload a PDF to begin.")
+            st.success("Custom knowledge base ready!")
+
+        # Priority 2: Use the local Rag_pdf.pdf file
+        elif default_file_exists:
+            with st.spinner("Loading local medical guidelines..."):
+                with open(local_pdf_path, "rb") as f:
+                    process_pdf(f.read())
+            st.success("Default knowledge base loaded!")
+
+        # Fallback: No file found
+        else:
+            st.warning(
+                "No PDF found. Please upload a file or add 'Rag_pdf.pdf' to the root folder."
+            )
 
     st.divider()
     if st.button("Clear Chat History", use_container_width=True):
