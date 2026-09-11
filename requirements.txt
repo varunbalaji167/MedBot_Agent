@@ -5,3 +5,5 @@ numpy
 PyPDF2
 sentence-transformers
 transformers
+requests
+python-dotenv
