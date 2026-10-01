@@ -3,23 +3,12 @@ faulthandler.enable()
 
 import os
 
-# MUST be set before torch/faiss/numpy are imported below, not after --
-# these libraries read OMP_NUM_THREADS when their native OpenMP thread pool
-# is first initialized. A macOS crash report (EXC_BAD_ACCESS/SIGSEGV inside
-# libomp.dylib's __kmp_launch_worker/__kmp_fork_barrier, i.e. an OpenMP
-# worker thread being spun up) confirmed this is the classic dual-OpenMP-
-# runtime collision: torch and faiss each bundle their own copy of libomp,
-# and when BOTH actually spin up worker threads in the same process, the two
-# runtimes corrupt each other's thread-pool bookkeeping. Setting
-# faiss.omp_set_num_threads(1) (done separately in rag_core.py) only
-# constrained FAISS's side of this -- torch's own OpenMP pool (used inside
-# MiniLM's forward pass during embed_fn) was still spinning up multiple
-# worker threads and hitting the same collision. Forcing this globally,
-# before import, is the fix that actually stops any of these libraries from
-# creating a multi-thread OpenMP pool in the first place.
+# Must be set before torch/faiss/numpy import: both bundle libomp and a dual
+# OpenMP pool segfaults on macOS; one thread avoids it.
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 
 import time
+import html
 import pickle
 from io import BytesIO
 from pathlib import Path
@@ -33,11 +22,7 @@ from sentence_transformers import SentenceTransformer
 
 import rag_core
 
-# Anchored to this file's own directory, NOT the current working directory --
-# load_dotenv() with no arguments depends on where the process was launched
-# FROM, which silently finds nothing if you run `streamlit run app.py` from
-# any directory other than this one. This makes .env loading independent of
-# that.
+# Anchor .env to this file's dir so it loads regardless of the launch cwd.
 _ENV_PATH = Path(__file__).resolve().parent / ".env"
 _dotenv_loaded = load_dotenv(dotenv_path=_ENV_PATH)
 
@@ -85,76 +70,39 @@ def reset_knowledge_base():
 
 
 # 2. MODEL LOADING
-#
-# All decision logic (confidence gate, risk fallback, chunking) lives in
-# rag_core.py and knows nothing about Streamlit/FAISS/PyTorch. This file's
-# job is just to supply the real embed_fn / generate_fn / index backend that
-# rag_core's functions are called with.
+# Decision logic lives in rag_core.py; this file supplies the real
+# embed_fn / generate_fn / index backend it's called with.
 
-HF_TOKEN = os.environ.get("HUGGINGFACE_HUB_TOKEN", "").strip()
-# NOTE ON MODEL CHOICE: Hugging Face's Inference Providers only serve a
-# SUBSET of models on the Hub, through a SUBSET of partner providers, and
-# which specific provider variant is "live" (serverless, pay-per-call) vs.
-# requiring a paid dedicated endpoint varies per model and changes over
-# time. Don't guess -- check directly before relying on a model:
-#
-#   curl -s "https://huggingface.co/api/models/<MODEL_ID>?expand[]=inferenceProviderMapping"
-#
-# Look for a provider entry with "status": "live".
-#
-# Qwen/Qwen2.5-7B-Instruct (the previous default) turned out to have exactly
-# ONE provider mapped (Together AI), and that mapping resolved to a "Turbo"
-# variant requiring a paid DEDICATED endpoint -- i.e. no free/serverless
-# route existed for it at all, so every single call fell through to the
-# slow local fallback. gpt-oss-20b is used here instead: OpenAI's own
-# open-weight release is confirmed (via third-party integration docs dated
-# the same day this was written) to have live multi-provider routing for
-# its 120b sibling; the 20b variant is released as part of the same matched
-# pair and providers hosting one typically host both, but that specific
-# claim for 20b was NOT independently re-verified at the time this default
-# was set (a live web check was unavailable) -- confirm with the curl
-# command above before trusting this in anything beyond a demo.
-HF_GENERATION_MODEL = os.environ.get("HF_GENERATION_MODEL", "openai/gpt-oss-20b:fastest")
-# Hugging Face deprecated the old per-model "api-inference.huggingface.co"
-# endpoint in favor of a single OpenAI-compatible router across all
-# Inference Providers. This is the CURRENT endpoint as of this writing.
-HF_ROUTER_URL = "https://router.huggingface.co/v1/chat/completions"
+# Generation backend: ANY OpenAI-compatible chat-completions endpoint (HF
+# router, Groq, OpenRouter, Google Gemini, local Ollama, ...). Set all three in
+# .env to switch providers -- no code change. Defaults keep the HF router.
+# (Old HUGGINGFACE_HUB_TOKEN / HF_GENERATION_MODEL names still work.)
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://router.huggingface.co/v1/chat/completions").strip()
+LLM_API_KEY = (os.environ.get("LLM_API_KEY") or os.environ.get("HUGGINGFACE_HUB_TOKEN", "")).strip()
+LLM_MODEL = (os.environ.get("LLM_MODEL") or os.environ.get("HF_GENERATION_MODEL") or "openai/gpt-oss-20b").strip()
 
-# Off by default. The two debug expanders (HF API failure details, raw model
-# output for "not covered" answers) were essential during development but
-# expose internal error text and prompt/response internals -- fine for you
-# running this locally, not something a random visitor to a shared/deployed
-# instance should see by default. Set MEDIBOT_DEBUG=1 in .env to turn them
-# back on.
+# Off by default; the debug expanders expose internal error/prompt text that a
+# shared instance shouldn't show. Set MEDIBOT_DEBUG=1 in .env to enable.
 DEBUG_MODE = os.environ.get("MEDIBOT_DEBUG", "").strip() == "1"
 
 
 @st.cache_resource
 def load_embed_model():
-    # device="cpu" is explicit and deliberate, not a default we left
-    # unset. On Apple Silicon, sentence-transformers auto-selects the MPS
-    # (Metal) backend when available -- but MPS has a known constraint
-    # around being driven from the process's main thread, and Streamlit
-    # runs the app script in a separate worker thread (ScriptRunner), not
-    # the main thread. That mismatch is a plausible-fit explanation for a
-    # native segfault that reproduces under `streamlit run` but not when
-    # the same encode() call is run as a plain top-level script. MiniLM is
-    # tiny enough that CPU-only has no meaningful performance cost here.
+    # device="cpu" on purpose: MPS auto-select segfaults under Streamlit's
+    # worker thread, and MiniLM is cheap on CPU anyway.
     return SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
 
 
 @st.cache_resource
 def load_local_generator():
-    # torch/transformers imported here, not at module top -- so simply
-    # importing app.py (or rag_core.py, for tests) never requires them
-    # unless the local fallback generator is actually instantiated.
+    # Import here so plain `import app`/tests never need torch/transformers.
     import torch  # noqa
     from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
     MODEL_ID = "google/flan-t5-large"
     tok = AutoTokenizer.from_pretrained(MODEL_ID)
     mdl = AutoModelForSeq2SeqLM.from_pretrained(MODEL_ID)
-    mdl.to("cpu")  # explicit for the same reason as load_embed_model() above -- avoid MPS auto-selection under Streamlit's worker thread
+    mdl.to("cpu")  # avoid MPS auto-select under Streamlit's worker thread
     mdl.eval()
     return tok, mdl
 
@@ -163,6 +111,9 @@ embed_model = load_embed_model()
 EMBED_DIM = embed_model.get_sentence_embedding_dimension()
 
 CACHE_DIR = ".kb_cache"
+# Bump when cached content changes (chunking/embedding) so old pickles are
+# ignored and documents re-embed. v4: subsection-level chunking.
+_CACHE_VERSION = "v4"
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 
@@ -171,19 +122,14 @@ def embed_fn(texts: list[str]) -> np.ndarray:
     return rag_core.l2_normalize(raw.astype(np.float32))
 
 
-# 3. GENERATION BACKEND (HF Inference API with local fallback)
+# 3. GENERATION BACKEND (OpenAI-compatible API with local fallback)
 
 
-def _call_hf_inference_api(system_prompt: str, user_prompt: str, max_new_tokens: int, temperature: float = 0.3) -> str:
-    """Calls Hugging Face's Inference Providers router -- an OpenAI-compatible
-    chat completions endpoint that fans out to whichever partner (Together,
-    Fireworks, Cerebras, etc.) currently serves HF_GENERATION_MODEL. We send
-    plain system/user messages; the provider applies that model's own chat
-    template server-side, so there's no hand-built prompt-template string to
-    maintain here (unlike the old per-model text-generation endpoint)."""
-    headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+def _call_chat_api(system_prompt: str, user_prompt: str, max_new_tokens: int, temperature: float = 0.3) -> str:
+    """Call any OpenAI-compatible chat-completions endpoint (LLM_BASE_URL)."""
+    headers = {"Authorization": f"Bearer {LLM_API_KEY}"}
     payload = {
-        "model": HF_GENERATION_MODEL,
+        "model": LLM_MODEL,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
@@ -193,15 +139,15 @@ def _call_hf_inference_api(system_prompt: str, user_prompt: str, max_new_tokens:
     }
 
     last_error = None
-    for attempt in range(2):  # one retry for transient 5xx from the routed provider
-        resp = requests.post(HF_ROUTER_URL, headers=headers, json=payload, timeout=25)
+    for attempt in range(2):  # one retry for transient 5xx
+        resp = requests.post(LLM_BASE_URL, headers=headers, json=payload, timeout=25)
         if resp.status_code == 200:
             data = resp.json()
             try:
                 return data["choices"][0]["message"]["content"].strip()
             except (KeyError, IndexError) as e:
-                raise RuntimeError(f"Unexpected HF router response shape: {data}") from e
-        last_error = f"HF router error {resp.status_code}: {resp.text[:300]}"
+                raise RuntimeError(f"Unexpected LLM API response shape: {data}") from e
+        last_error = f"LLM API error {resp.status_code}: {resp.text[:300]}"
         if resp.status_code >= 500 and attempt == 0:
             time.sleep(2)
             continue
@@ -214,25 +160,13 @@ def _generate_with_local_flan(system_prompt: str, user_prompt: str, max_new_toke
     import torch
 
     tokenizer, model = load_local_generator()
-    # flan-t5 was instruction-tuned on short, direct instruction->completion
-    # pairs, not chat-style system/user framing. A plain concatenation of
-    # the two (as used for the API model, which handles chat format
-    # natively) left this weaker model prone to pattern-matching onto the
-    # word "UNAVAILABLE" mentioned in its own instructions rather than
-    # actually reasoning about the context -- reproduced in testing on a
-    # clearly in-scope question. Appending an explicit "Answer:" completion
-    # cue is a well-established way to pull a T5-family model toward
-    # actually completing the answer instead of echoing back part of its
-    # instructions.
+    # flan-t5 expects instruction->completion framing; the "Answer:" cue pulls
+    # it toward completing rather than echoing its own instructions.
     full_prompt = f"{system_prompt}\n{user_prompt}\n\nAnswer:"
     inputs = tokenizer(full_prompt, return_tensors="pt", truncation=True, max_length=900)
     with torch.no_grad():
         output_ids = model.generate(
-            # num_beams reduced from 4 -> 2: this is a FALLBACK path, not the
-            # primary one -- beam search cost scales roughly linearly with
-            # beam count on CPU, so this materially cuts local-generation
-            # latency. 2 beams still gives some search benefit over pure
-            # greedy decoding (num_beams=1) without paying for 4.
+            # num_beams=2: fallback path, so trade a little search quality for CPU latency.
             **inputs, max_new_tokens=max_new_tokens, num_beams=2,
             length_penalty=2.0, early_stopping=True, no_repeat_ngram_size=3,
         )
@@ -240,31 +174,17 @@ def _generate_with_local_flan(system_prompt: str, user_prompt: str, max_new_toke
 
 
 def llm_generate(system_prompt: str, user_prompt: str, max_new_tokens: int = 300, temperature: float = 0.3) -> str:
-    """temperature defaults to 0.3 (a bit of natural fluency for the main
-    answer-generation task) but callers doing near-deterministic work --
-    rewriting a query, classifying into one of three fixed risk labels --
-    should pass temperature=0.0. Using 0.3 unconditionally everywhere was a
-    real bug: the SAME input to condense_question could get rewritten
-    differently across runs purely from sampling noise, which is exactly
-    what reproduced as an intermittent "this worked a minute ago" failure
-    (a previously-fine standalone question occasionally retrieving poorly
-    after being needlessly reworded). The local flan-t5 fallback already
-    uses beam search (no sampling), so temperature has no effect there --
-    it's only meaningful on the HF API path."""
-    if HF_TOKEN:
+    """temperature=0.3 for answers; pass 0.0 for deterministic work (query
+    rewrite, risk classify). No effect on the beam-search local fallback."""
+    if LLM_API_KEY:
         try:
-            return _call_hf_inference_api(system_prompt, user_prompt, max_new_tokens, temperature=temperature)
+            return _call_chat_api(system_prompt, user_prompt, max_new_tokens, temperature=temperature)
         except Exception as e:
-            # Previously this was a bare `except Exception: pass` -- silent
-            # by design for graceful fallback, but that also meant genuine
-            # API failures (bad model id, auth issue, rate limit, malformed
-            # response) were indistinguishable from "no token configured" in
-            # the UI, and the only symptom was "it's slow and answers oddly"
-            # with zero way to find out why. Recording it (without breaking
-            # the fallback behavior itself) is what actually makes this
-            # debuggable instead of another guessing exercise.
+            # Record the failure (don't swallow it) so "slow and odd" is diagnosable.
             err_msg = f"{type(e).__name__}: {e}"
-            print(f"[MediBot] HF Inference API call failed, falling back to local model: {err_msg}")
+            print(f"[MediBot] LLM API call failed, falling back to local model: {err_msg}")
+            # User-visible signal (read by _backup_notice); caller resets it first.
+            st.session_state["hf_fallback_used"] = True
             if DEBUG_MODE:
                 st.session_state.setdefault("hf_api_errors", [])
                 st.session_state["hf_api_errors"].append(err_msg)
@@ -278,7 +198,7 @@ def classify_risk_llm(symptom_text: str) -> str | None:
             rag_core.RISK_TAXONOMY_SYSTEM_PROMPT,
             f"Patient description: {symptom_text}",
             max_new_tokens=10,
-            temperature=0.0,  # a safety classification should not vary run-to-run for identical input
+            temperature=0.0,  # a safety classification must be stable per input
         ).strip().upper()
         for level in ("HIGH", "MODERATE", "LOW"):
             if level in result:
@@ -288,7 +208,7 @@ def classify_risk_llm(symptom_text: str) -> str | None:
         return None
 
 
-# 4. PDF PROCESSING & KB MANAGEMENT (I/O layer; chunking math itself is in rag_core)
+# 4. PDF PROCESSING & KB MANAGEMENT (I/O layer; chunking math is in rag_core)
 
 
 def extract_pages(file_bytes: bytes) -> list[str]:
@@ -301,7 +221,7 @@ def extract_pages(file_bytes: bytes) -> list[str]:
 
 
 def load_cached_doc(doc_hash: str):
-    path = os.path.join(CACHE_DIR, f"{doc_hash}.pkl")
+    path = os.path.join(CACHE_DIR, f"{doc_hash}.{_CACHE_VERSION}.pkl")
     if not os.path.exists(path):
         return None
     try:
@@ -313,7 +233,7 @@ def load_cached_doc(doc_hash: str):
 
 
 def save_cached_doc(doc_hash: str, chunks: list[dict], embeddings: np.ndarray):
-    path = os.path.join(CACHE_DIR, f"{doc_hash}.pkl")
+    path = os.path.join(CACHE_DIR, f"{doc_hash}.{_CACHE_VERSION}.pkl")
     with open(path, "wb") as f:
         pickle.dump({"chunks": chunks, "embeddings": embeddings}, f)
 
@@ -383,30 +303,36 @@ def remove_document(doc_hash: str):
 
 # 5. CONVERSATIONAL LOGIC
 
-# Controlled-input options for the symptom-detail form, replacing free-text
-# answers to "duration/severity/profile" questions. Free text (e.g. "idk")
-# used to flow straight through into the final assessment with no real
-# validation -- a slider literally cannot produce an out-of-range severity,
-# a selectbox literally cannot produce an unparseable duration, so this
-# closes that gap structurally rather than by adding string-parsing checks
-# after the fact.
+# Controlled form inputs (no free-text parsing). Conditions are GENERAL
+# comorbidities, not tied to the loaded KB, plus a free-text "Other".
 DURATION_OPTIONS = ["Less than a day", "1-2 days", "3-7 days", "1-2 weeks", "More than 2 weeks"]
-CONDITION_OPTIONS = ["None", "Diabetes", "Hypertension", "Asthma", "COPD", "Other"]
+CONDITION_OPTIONS = [
+    "None", "Diabetes", "Hypertension", "Asthma", "COPD", "Heart disease",
+    "Kidney disease", "Cancer", "Pregnancy", "Immunocompromised", "Other",
+]
 
 
 def _record_debug_generation(result: dict):
-    """When the not-covered message fires but the model actually produced
-    non-trivial output, keep that raw output visible in the sidebar so
-    "why did this get refused" is answerable by looking, not by guessing and
-    re-running with print statements each time. Only active when DEBUG_MODE
-    is on -- see the DEBUG_MODE definition for why this is opt-in."""
+    """Keep the raw model output visible in the sidebar when it didn't become
+    the shown answer (out-of-scope or extractive fallback). DEBUG_MODE only."""
     if not DEBUG_MODE:
         return
     raw = result.get("raw_generation")
-    if result["answer"] == rag_core.NOT_COVERED_MSG and raw:
+    if raw and result.get("mode") in ("not_covered", "extractive"):
         st.session_state.setdefault("debug_generations", [])
         st.session_state["debug_generations"].append(raw)
         st.session_state["debug_generations"] = st.session_state["debug_generations"][-5:]
+
+
+def _backup_notice() -> str:
+    """Notice when this turn fell back to the local backup model (HF API
+    failed). Empty otherwise; callers reset the flag before generating."""
+    if st.session_state.get("hf_fallback_used"):
+        return (
+            "⚠️ The primary model was unavailable, so this was generated by the "
+            "local backup model — quality may be lower. "
+        )
+    return ""
 
 
 def format_patient_summary() -> str:
@@ -425,34 +351,58 @@ def build_final_response(initial_msg: str) -> dict:
     patient_summary = format_patient_summary()
     p = st.session_state.patient_info
 
-    enriched_query = f"{initial_msg}. Patient profile: {patient_summary}. Explain possible causes and recommended next steps."
+    st.session_state["hf_fallback_used"] = False  # reset before any LLM call this turn
+    # Retrieve on the complaint only; the profile (esp. conditions) would
+    # otherwise skew retrieval toward the wrong topic. The LLM still gets the
+    # profile via patient_info.
+    gen_question = f"{initial_msg}. Explain possible causes and recommended next steps."
     result = rag_core.generate_answer(
         st.session_state.faiss_index, st.session_state.text_chunks, embed_fn, llm_generate,
-        enriched_query, patient_info=patient_summary,
+        gen_question, patient_info=patient_summary, retrieval_query=initial_msg,
     )
     _record_debug_generation(result)
-    risk = rag_core.assess_risk(initial_msg, classify_fn=classify_risk_llm)
+    # Pass structured form signals so triage reflects severity/conditions.
+    risk = rag_core.assess_risk(
+        initial_msg,
+        severity=p.get("severity"),
+        conditions=p.get("conditions"),
+        classify_fn=classify_risk_llm,
+    )
 
     sev = p.get("severity", "not provided")
-    dur = p.get("duration", "not provided")
-    pro = p.get("profile", "not provided")
+    dur = html.escape(str(p.get("duration", "not provided")))
+    pro = html.escape(str(p.get("profile", "not provided")))
 
     action = "Monitor your symptoms. Maintain a healthy lifestyle and stay hydrated."
     if "HIGH" in risk["level"]:
         action = "**Seek emergency care immediately.** Do not delay."
     elif "MODERATE" in risk["level"]:
-        # severity now always comes from a 1-10 slider (never free text), so
-        # this can be trusted as a real int directly -- no isdigit() fallback needed.
-        sev_num = int(sev) if isinstance(sev, int) else 5
+        sev_num = int(sev) if isinstance(sev, int) else 5  # slider guarantees an int
         action = "Visit a doctor or urgent care **today**." if sev_num >= 7 else "Schedule a doctor appointment **within 48 hours**."
 
-    html = f"""
+    # Escape model/KB text before it enters the unsafe_allow_html card.
+    safe_answer = html.escape(result["answer"])
+    if result.get("mode") == "extractive":
+        assessment = (
+            "<i>I couldn't generate a polished summary, so here is the most "
+            "relevant information directly from the knowledge base:</i><br>"
+            + safe_answer
+        )
+    else:
+        assessment = safe_answer
+
+    # No relevance figure next to an "I don't have enough knowledge" answer.
+    relevance_line = ""
+    if result.get("mode") != "not_covered":
+        relevance_line = f"Source relevance: {result.get('display_confidence', 0)}% &nbsp;|&nbsp; "
+
+    card_html = f"""
 <div style='background-color: #f8f9fa; color: #1e1e1e; border-radius: 8px; border-left:5px solid {risk["border"]}; padding: 15px; margin-bottom: 10px;'>
 <b style='color: #000;'>Patient Summary</b><br>
 Profile: <b>{pro}</b> | Duration: <b>{dur}</b> | Severity: <b>{sev}/10</b><br><br>
 
 <b style='color: #000;'>Medical Assessment</b><br>
-{result["answer"]}<br><br>
+{assessment}<br><br>
 
 <b style='color: #000;'>Risk Level: {risk["level"]}</b><br>
 {risk["explanation"]}<br><br>
@@ -460,17 +410,16 @@ Profile: <b>{pro}</b> | Duration: <b>{dur}</b> | Severity: <b>{sev}/10</b><br><b
 <b style='color: #000;'>Recommended Action</b><br>
 {action}<br><br>
 
-<small style='color:#555;'>Confidence: {result["confidence"]}% &nbsp;|&nbsp; This is not a medical diagnosis. Always consult a qualified doctor.</small>
+<small style='color:#555;'>{_backup_notice()}{relevance_line}This is not a medical diagnosis. Always consult a qualified doctor.</small>
 </div>
 """
-    return {"content": html, "sources": result["sources"], "plain_text": result["answer"]}
+    return {"content": card_html, "sources": result["sources"], "plain_text": result["answer"]}
 
 
 def process_message(user_message: str) -> dict:
-    """Only called for chat_input turns now -- the clarifying phase is
-    handled entirely by the form in the UI section below, not through this
-    function, since it's no longer a sequence of free-text chat replies."""
+    """Handles chat_input turns; the clarifying phase is driven by the form below."""
     user_message = user_message.strip()
+    st.session_state["hf_fallback_used"] = False  # reset before any LLM call this turn
 
     if st.session_state.faiss_index is None or st.session_state.faiss_index.ntotal == 0:
         msg = "**Please add a medical knowledge PDF in the sidebar first.**"
@@ -498,13 +447,7 @@ def process_message(user_message: str) -> dict:
             if prior_history else user_message
         )
         if query_for_rag != user_message:
-            # Same principle as the HF-error and raw-generation visibility
-            # added earlier: a step that silently rewrites the user's actual
-            # question is exactly the kind of thing that needs to be
-            # inspectable, not inferred after the fact -- this is what let a
-            # regression (a previously-working standalone question breaking
-            # once prior chat history existed) actually get diagnosed instead
-            # of guessed at.
+            # Make the silent query rewrite inspectable.
             print(f"[MediBot] condensed query: {user_message!r} -> {query_for_rag!r}")
             if DEBUG_MODE:
                 st.session_state.setdefault("condensed_queries", [])
@@ -514,7 +457,20 @@ def process_message(user_message: str) -> dict:
             st.session_state.faiss_index, st.session_state.text_chunks, embed_fn, llm_generate, query_for_rag,
         )
         _record_debug_generation(result)
-        content = f"**Medical Information**\n\n{result['answer']}\n\n<small style='color:#888;'>Confidence: {result['confidence']}% | Always verify with a healthcare professional.</small>"
+        answer_text = html.escape(result["answer"])
+        if result.get("mode") == "extractive":
+            answer_text = (
+                "*I couldn't generate a polished summary, so here is the most "
+                "relevant information directly from the knowledge base:*\n\n"
+                + answer_text
+            )
+        if result.get("mode") == "not_covered":
+            content = f"**Medical Information**\n\n{answer_text}"  # no relevance figure
+        else:
+            content = (
+                f"**Medical Information**\n\n{answer_text}\n\n"
+                f"<small style='color:#888;'>{_backup_notice()}Source relevance: {result.get('display_confidence', 0)}% | Always verify with a healthcare professional.</small>"
+            )
         return {"content": content, "sources": result["sources"], "plain_text": result["answer"]}
 
 
@@ -571,9 +527,10 @@ with st.sidebar:
         st.warning("No documents loaded. Add a PDF above.")
 
     st.divider()
-    st.caption(f"Generation backend: {'Hugging Face API (' + HF_GENERATION_MODEL + ')' if HF_TOKEN else 'local flan-t5-large (no HF token set)'}")
-    if not HF_TOKEN:
-        st.caption(f"⚠️ HUGGINGFACE_HUB_TOKEN not detected. Looked for a .env file at: `{_ENV_PATH}` (found: {_dotenv_loaded}).")
+    _host = LLM_BASE_URL.split("/v1")[0].replace("https://", "")
+    st.caption(f"Generation backend: {_host} — {LLM_MODEL}" if LLM_API_KEY else "local flan-t5-large (no API key set)")
+    if not LLM_API_KEY:
+        st.caption(f"⚠️ No LLM API key set (LLM_API_KEY / HUGGINGFACE_HUB_TOKEN). Looked for .env at: `{_ENV_PATH}` (found: {_dotenv_loaded}). Using the local flan-t5 fallback.")
     if st.session_state.get("hf_api_errors"):
         with st.expander(f"⚠️ HF API call(s) failed, used local fallback ({len(st.session_state['hf_api_errors'])} recent)"):
             for err in reversed(st.session_state["hf_api_errors"]):
@@ -622,17 +579,15 @@ for msg in st.session_state.messages:
         render_sources(msg.get("sources"))
 
 if st.session_state.phase == "clarifying":
-    # Controlled-input form instead of free-text chat replies. Each widget
-    # constrains its own input by construction -- the slider cannot leave
-    # 1-10, the selectbox cannot contain arbitrary text, age is a bounded
-    # number -- so there is no "idk"-shaped input to defend against here,
-    # rather than validating free text after the fact.
+    # Controlled-input form: each widget constrains its own input, so there's
+    # no free-text "idk" to validate after the fact.
     with st.chat_message("assistant"):
         with st.form("symptom_details_form"):
             duration = st.selectbox("Duration of symptoms", DURATION_OPTIONS, index=None, placeholder="Select one...")
             severity = st.slider("Severity (1 = very mild, 10 = unbearable)", min_value=1, max_value=10, value=5)
             age = st.number_input("Age", min_value=0, max_value=120, step=1, value=None, placeholder="Enter age")
             conditions = st.multiselect("Existing medical conditions (select all that apply)", CONDITION_OPTIONS)
+            other_conditions = st.text_input("If you chose 'Other', list the condition(s)", placeholder="e.g. lupus, epilepsy")
             submitted = st.form_submit_button("Get my assessment")
 
         if submitted:
@@ -643,14 +598,21 @@ if st.session_state.phase == "clarifying":
                 missing.append("age")
             if not conditions:
                 missing.append("existing conditions (choose 'None' if not applicable)")
+            if "Other" in conditions and not other_conditions.strip():
+                missing.append("the 'Other' condition details")
 
             if missing:
                 st.error(f"Please fill in: {', '.join(missing)}.")
             else:
-                condition_str = ", ".join(conditions)
+                # Replace the "Other" placeholder with the typed condition(s).
+                final_conditions = [c for c in conditions if c != "Other"]
+                if other_conditions.strip():
+                    final_conditions += [t.strip() for t in other_conditions.split(",") if t.strip()]
+                condition_str = ", ".join(final_conditions) if final_conditions else "None"
                 st.session_state.patient_info = {
                     "duration": duration,
                     "severity": severity,
+                    "conditions": final_conditions,  # structured list, used by assess_risk
                     "profile": f"{int(age)} years old, conditions: {condition_str}",
                 }
                 with st.spinner("Analyzing..."):
@@ -688,4 +650,4 @@ if st.session_state.phase != "clarifying":
                     }
                 )
                 if st.session_state.phase == "clarifying":
-                    st.rerun()  # immediately show the form instead of waiting for the next interaction
+                    st.rerun()  # show the form immediately
